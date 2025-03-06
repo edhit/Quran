@@ -34,7 +34,7 @@ function isValidPageNumber(pageNumber) {
 }
 
 function isAuthorizedUser(chatId) {
-  return chatId === USER_CHAT_ID;
+  return chatId == USER_CHAT_ID;
 }
 
 async function fetchAyahsByPage(pageNumber) {

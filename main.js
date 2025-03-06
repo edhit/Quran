@@ -60,18 +60,28 @@ async function fetchAyahsByPage(pageNumber) {
 }
 
 function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return [];
+  if (!fs.existsSync(DATA_FILE)) {
+    return []; // Возвращаем пустой массив, если файл не существует
+  }
   return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
 }
 
 function backupData() {
+  if (!fs.existsSync(DATA_FILE)) {
+    // Если файл не существует, создаем его с пустым массивом
+    fs.writeFileSync(DATA_FILE, JSON.stringify([]));
+    logger.info(`Файл ${DATA_FILE} создан.`);
+    return;
+  }
+
+  // Если файл существует, создаем резервную копию
   const backupFile = `quran_data_backup_${new Date().toISOString()}.json`;
   fs.copyFileSync(DATA_FILE, backupFile);
   logger.info(`Создана резервная копия: ${backupFile}`);
 }
 
 function saveData(data) {
-  backupData();
+  backupData(); // Создаем резервную копию (или файл, если он не существует)
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 

@@ -37,13 +37,19 @@ function isAuthorizedUser(chatId) {
   return chatId == USER_CHAT_ID;
 }
 
-async function fetchAyahsByPage(pageNumber) {
+async function fetchAyahsByPage(pageNumber, startAyah, endAyah) {
   try {
     const response = await axios.get(`${API_URL}${pageNumber}/quran-uthmani`);
     if (!response.data || !response.data.data || !response.data.data.ayahs) {
       throw new Error("Некорректный ответ от API");
     }
-    return response.data.data.ayahs.map(ayah => ({
+
+    // Фильтруем аяты по диапазону
+    const filteredAyahs = response.data.data.ayahs.filter(
+      ayah => ayah.numberInSurah >= startAyah && ayah.numberInSurah <= endAyah
+    );
+
+    return filteredAyahs.map(ayah => ({
       number: ayah.number,
       text: ayah.text,
       surah: ayah.surah.number,
@@ -166,6 +172,39 @@ bot.command("addpage", async (ctx) => {
   }
 });
 
+bot.command("addayah", async (ctx) => {
+  if (!isAuthorizedUser(ctx.message.chat.id)) {
+    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  }
+
+  const args = ctx.message.text.split(" ");
+  if (args.length < 4) {
+    return ctx.reply("❌ Используйте команду так: /addayah <номер_страницы> <начальный_аят> <конечный_аят>");
+  }
+
+  const pageNumber = parseInt(args[1]);
+  const startAyah = parseInt(args[2]);
+  const endAyah = parseInt(args[3]);
+
+  if (!isValidPageNumber(pageNumber) || isNaN(startAyah) || isNaN(endAyah)) {
+    return ctx.reply("❌ Укажите корректные номера страницы и аятов.");
+  }
+
+  if (startAyah > endAyah) {
+    return ctx.reply("❌ Начальный аят не может быть больше конечного.");
+  }
+
+  const newAyahs = await fetchAyahsByPage(pageNumber, startAyah, endAyah);
+  if (newAyahs.length === 0) {
+    return ctx.reply("❌ Аяты не найдены.");
+  }
+
+  let data = loadData();
+  data = [...data, ...newAyahs];
+  saveData(data);
+  ctx.reply(`✅ Аяты ${startAyah}-${endAyah} со страницы ${pageNumber} добавлены.`);
+});
+
 bot.command("list", async (ctx) => {
   if (!isAuthorizedUser(ctx.message.chat.id)) {
     return ctx.reply("❌ У вас нет доступа к этой команде.");
@@ -222,24 +261,24 @@ bot.command("update", async (ctx) => {
 });
 
 bot.command("help", (ctx) => {
-    const helpMessage = `
-  📚 *Инструкция по использованию бота:*
-  
-  /addpage <номер_страницы> — Добавить страницу для заучивания (например, /addpage 1).
-  /review — Получить аяты для повторения на сегодня.
-  /list — Показать все страницы, которые находятся в процессе заучивания.
-  /remove <номер_страницы> — Удалить страницу из списка заучивания (например, /remove 1).
-  /update — Обновить расписание повторений вручную.
-  /help — Показать это сообщение.
-  
-  *Примеры:*
-  - Добавить страницу 1: /addpage 1
-  - Удалить страницу 1: /remove 1
-  - Получить аяты для повторения: /review
-  `;
-  
-    ctx.replyWithMarkdown(helpMessage);
-  });
+  const helpMessage = `
+📚 *Инструкция по использованию бота:*
+
+/addayah <номер_страницы> <начальный_аят> <конечный_аят> — Добавить аяты для заучивания (например, /addayah 1 1 10).
+/review — Получить аяты для повторения на сегодня.
+/list — Показать все страницы, которые находятся в процессе заучивания.
+/remove <номер_страницы> — Удалить страницу из списка заучивания (например, /remove 1).
+/update — Обновить расписание повторений вручную.
+/help — Показать это сообщение.
+
+*Примеры:*
+- Добавить аяты 1-10 со страницы 1: /addayah 1 1 10
+- Удалить страницу 1: /remove 1
+- Получить аяты для повторения: /review
+`;
+
+  ctx.replyWithMarkdown(helpMessage);
+});
 
 schedule.scheduleJob("0 6 * * *", () => {
   logger.info("Обновление статуса повторения...");

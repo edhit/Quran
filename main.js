@@ -233,7 +233,7 @@ bot.command("review", async (ctx) => {
 });
 
 // Расписание для автоматической отправки в 6 утра
-schedule.scheduleJob("0 6 * * *", async () => {
+schedule.scheduleJob("0 3 * * *", async () => {
   logger.info("Обновление статуса повторения и отправка аятов...");
   updateReviewSchedule();
   await sendReviewAyahs(USER_CHAT_ID); // Используем USER_CHAT_ID из переменных окружения

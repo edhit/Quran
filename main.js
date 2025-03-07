@@ -164,27 +164,20 @@ function getAudioUrl(ayah, reciter) {
   return `https://api.alquran.cloud/v1/ayah/${ayah.surah}:${ayah.ayah}/${reciterCode}`;
 }
 
-bot.command("review", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
-  }
-
-  const args = ctx.message.text.split(" ");
-  const reciter = args[1] || "husary"; // По умолчанию Хусари
-
+async function sendReviewAyahs(chatId, reciter = "husary") {
   const ayahs = getAyahsForReview();
   if (ayahs.length === 0) {
-    return ctx.reply("Сегодня нет аятов для повторения.");
+    logger.info("Сегодня нет аятов для повторения.");
+    await bot.telegram.sendMessage(chatId, "Сегодня нет аятов для повторения.");
+    return;
   }
 
   for (const ayah of ayahs) {
     try {
-      // Получаем ссылку на аудио
       const audioUrl = getAudioUrl(ayah, reciter);
       const response = await axios.get(audioUrl);
       const audioLink = response.data.data.audio;
 
-      // Загружаем файл
       const filePath = `ayah_${ayah.surah}_${ayah.ayah}.mp3`;
       const writer = fs.createWriteStream(filePath);
       const audioResponse = await axios.get(audioLink, { responseType: "stream" });
@@ -195,44 +188,55 @@ bot.command("review", async (ctx) => {
         writer.on("error", reject);
       });
 
-      // Устанавливаем новые метаданные
       const tags = {
         title: `Сура ${ayah.surah}, Аят ${ayah.ayah}`,
-        artist: `Шейх ${reciter.charAt(0).toUpperCase() + reciter.slice(1)}`, // Имя чтеца
+        artist: `Шейх ${reciter.charAt(0).toUpperCase() + reciter.slice(1)}`,
         album: "Holy Quran",
         comment: { text: "Из AlQuran Cloud API" },
       };
       NodeID3.write(tags, filePath);
 
-      // Формируем текст
       const messageText = `📖 *${ayah.surah}:${ayah.ayah}* (стр. ${ayah.page})\n${ayah.text}`;
 
       try {
-        // Пробуем отправить аудио с подписью
-        await ctx.replyWithAudio({ source: filePath }, {
+        await bot.telegram.sendAudio(chatId, { source: filePath }, {
           caption: messageText,
           parse_mode: "Markdown",
         });
       } catch (error) {
         if (error.response && error.response.error_code === 400 && error.response.description.includes("message caption is too long")) {
-          // Если ошибка из-за длинного текста — отправляем аудио без подписи
-          const audioMessage = await ctx.replyWithAudio({ source: filePath });
-
-          // Затем отправляем текст как ответ на аудио
-          await ctx.reply(messageText, { reply_to_message_id: audioMessage.message_id, parse_mode: "Markdown" });
+          const audioMessage = await bot.telegram.sendAudio(chatId, { source: filePath });
+          await bot.telegram.sendMessage(chatId, messageText, { reply_to_message_id: audioMessage.message_id, parse_mode: "Markdown" });
         } else {
-          throw error; // Если ошибка другая — пробрасываем её дальше
+          throw error;
         }
       }
 
-      // Удаляем временный файл
       fs.unlinkSync(filePath);
-      
     } catch (error) {
-      console.error("Ошибка при обработке аята:", error);
-      await ctx.reply(`📖 ${ayah.surah}:${ayah.ayah} (стр. ${ayah.page})\n${ayah.text}`);
+      logger.error(`Ошибка при отправке аята ${ayah.surah}:${ayah.ayah}:`, error);
+      await bot.telegram.sendMessage(chatId, `📖 ${ayah.surah}:${ayah.ayah} (стр. ${ayah.page})\n${ayah.text}`);
     }
   }
+}
+
+// Команда /review
+bot.command("review", async (ctx) => {
+  if (!isAuthorizedUser(ctx.message.chat.id)) {
+    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  }
+
+  const args = ctx.message.text.split(" ");
+  const reciter = args[1] || "husary"; // По умолчанию Хусари
+
+  await sendReviewAyahs(ctx.message.chat.id, reciter);
+});
+
+// Расписание для автоматической отправки в 6 утра
+schedule.scheduleJob("0 6 * * *", async () => {
+  logger.info("Обновление статуса повторения и отправка аятов...");
+  updateReviewSchedule();
+  await sendReviewAyahs(USER_CHAT_ID); // Используем USER_CHAT_ID из переменных окружения
 });
 
 bot.command("addpage", async (ctx) => {
@@ -461,11 +465,6 @@ bot.command("help", async (ctx) => {
     console.error("Ошибка при отправке сообщения:", error);
     await ctx.reply("Произошла ошибка при отправке инструкции. Пожалуйста, попробуйте еще раз.");
   }
-});
-
-schedule.scheduleJob("0 6 * * *", () => {
-  logger.info("Обновление статуса повторения...");
-  updateReviewSchedule();
 });
 
 bot.launch();

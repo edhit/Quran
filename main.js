@@ -5,11 +5,10 @@ const NodeID3 = require("node-id3");
 require("dotenv").config();
 const { Telegraf } = require("telegraf");
 const { createLogger, format, transports } = require("winston");
+const db = require('./database')
 
-const DATA_FILE = "quran_data.json";
 const API_URL = "https://api.alquran.cloud/v1/page/";
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const USER_CHAT_ID = process.env.USER_CHAT_ID;
 const bot = new Telegraf(BOT_TOKEN);
 
 const intervals = {
@@ -34,11 +33,35 @@ function isValidPageNumber(pageNumber) {
   return !isNaN(pageNumber) && pageNumber >= 1 && pageNumber <= 604;
 }
 
-function isAuthorizedUser(chatId) {
-  return chatId == USER_CHAT_ID;
+function getAudioUrl(ayah, reciter) {
+  const reciters = {
+    husary: "ar.husary",
+    alafasy: "ar.alafasy",
+    abdulsamad: "ar.abdulsamad",
+  };
+
+  const reciterCode = reciters[reciter] || reciters.husary; // По умолчанию Хусари
+  return `https://api.alquran.cloud/v1/ayah/${ayah.surah}:${ayah.ayah}/${reciterCode}`;
+}
+
+function formatAyahId(surah, ayah) {
+  // Номер суры и аята дополняем нулями до 3 символов
+  const surahPart = String(surah).padStart(3, "0");
+  const ayahPart = String(ayah).padStart(3, "0");
+
+  // Формируем окончательный ID: "1" + сура + аят
+  return `1${surahPart}${ayahPart}`;
 }
 
 async function fetchAyahsByPage(pageNumber, startAyah, endAyah) {
+  // Всегда сначала проверяем, есть ли аяты в таблице ayah_texts
+  const cachedAyahs = await getAyahsFromDatabase(pageNumber, startAyah, endAyah);
+  if (cachedAyahs.length > 0) {
+    return cachedAyahs;
+  }
+
+  logger.info(`Аяты для страницы ${pageNumber} не найдены в базе данных. Делаем запрос к API...`);
+  // Если аятов нет в базе данных, делаем запрос к API
   try {
     const response = await axios.get(`${API_URL}${pageNumber}/quran-uthmani`);
     if (!response.data || !response.data.data || !response.data.data.ayahs) {
@@ -46,14 +69,16 @@ async function fetchAyahsByPage(pageNumber, startAyah, endAyah) {
     }
 
     let filteredAyahs;
-    // Фильтруем аяты по диапазону
     if (startAyah && endAyah) {
       filteredAyahs = response.data.data.ayahs.filter(
         ayah => ayah.numberInSurah >= startAyah && ayah.numberInSurah <= endAyah
-      );  
+      );
     } else {
       filteredAyahs = response.data.data.ayahs;
     }
+
+    // Сохраняем аяты в базу данных
+    await saveAyahsToDatabase(filteredAyahs);
 
     return filteredAyahs.map(ayah => ({
       number: ayah.number,
@@ -71,148 +96,172 @@ async function fetchAyahsByPage(pageNumber, startAyah, endAyah) {
   }
 }
 
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) {
-    return []; // Возвращаем пустой массив, если файл не существует
-  }
-  return JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-}
-
-function deleteOldBackups() {
-  const backupFiles = fs.readdirSync(".").filter(file => file.startsWith("quran_data_backup_"));
-  if (backupFiles.length > 5) { // Оставляем только последние 5 резервных копий
-    backupFiles.sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs); // Сортируем по дате создания
-    const filesToDelete = backupFiles.slice(0, backupFiles.length - 5); // Удаляем все, кроме последних 5
-    filesToDelete.forEach(file => {
-      fs.unlinkSync(file);
-      logger.info(`Старая резервная копия удалена: ${file}`);
-    });
-  }
-}
-
-function backupData() {
-  if (!fs.existsSync(DATA_FILE)) {
-    // Если файл не существует, создаем его с пустым массивом
-    fs.writeFileSync(DATA_FILE, JSON.stringify([]));
-    logger.info(`Файл ${DATA_FILE} создан.`);
-    return;
-  }
-
-  // Удаляем старые резервные копии
-  deleteOldBackups();
-
-  // Создаем новую резервную копию
-  const backupFile = `quran_data_backup_${new Date().toISOString()}.json`;
-  fs.copyFileSync(DATA_FILE, backupFile);
-  logger.info(`Создана резервная копия: ${backupFile}`);
-}
-
-function saveData(data) {
-  backupData(); // Создаем резервную копию (или файл, если он не существует)
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
-async function addPageForMemorization(pageNumber) {
-  let data = loadData();
+async function addPageForMemorization(userId, pageNumber) {
   const newAyahs = await fetchAyahsByPage(pageNumber);
-  
   if (newAyahs.length === 0) {
     logger.warn(`Страница ${pageNumber} не найдена.`);
     return;
   }
 
-  data = [...data, ...newAyahs];
-  saveData(data);
-  logger.info(`Страница ${pageNumber} добавлена.`);
-}
+  const stmt = db.prepare(`
+    INSERT INTO ayahs (user_id, number, text, surah, ayah, page, next_review, review_stage, review_step)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
-function getAyahsForReview() {
-  const today = new Date();
-  return loadData().filter(ayah => new Date(ayah.nextReview) <= today);
-}
-
-function updateReviewSchedule() {
-  let data = loadData();
-  const today = new Date();
-
-  data.forEach(ayah => {
-    if (new Date(ayah.nextReview) <= today) {
-      let reviewSteps = intervals[ayah.reviewStage];
-      if (ayah.reviewStep >= reviewSteps.length - 1) {
-        if (ayah.reviewStage === "sabak") ayah.reviewStage = "sabki";
-        else if (ayah.reviewStage === "sabki") ayah.reviewStage = "manzil";
-        ayah.reviewStep = 0;
-      } else {
-        ayah.reviewStep++;
-      }
-      ayah.nextReview = new Date();
-      ayah.nextReview.setDate(today.getDate() + intervals[ayah.reviewStage][ayah.reviewStep]);
-    }
+  newAyahs.forEach(ayah => {
+    stmt.run(
+      userId,
+      ayah.number,
+      '', // ayah.text,
+      ayah.surah,
+      ayah.ayah,
+      ayah.page,
+      ayah.nextReview.toISOString(),
+      ayah.reviewStage,
+      ayah.reviewStep
+    );
   });
 
-  saveData(data);
+  stmt.finalize();
+  logger.info(`Страница ${pageNumber} добавлена для пользователя ${userId}.`);
 }
 
-function getAudioUrl(ayah, reciter) {
-  const reciters = {
-    husary: "ar.husary",
-    alafasy: "ar.alafasy",
-    abdulsamad: "ar.abdulsamad",
-  };
-
-  const reciterCode = reciters[reciter] || reciters.husary; // По умолчанию Хусари
-  return `https://api.alquran.cloud/v1/ayah/${ayah.surah}:${ayah.ayah}/${reciterCode}`;
+async function getUserByChatId(chatId) {
+  return new Promise((resolve, reject) => {
+    db.get("SELECT * FROM users WHERE chat_id = ?", [chatId], (err, row) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(row);
+      }
+    });
+  });
 }
 
-async function sendReviewAyahs(chatId, reciter = "husary") {
-  const ayahs = getAyahsForReview();
+async function getAyahsForReview(userId) {
+  return new Promise((resolve, reject) => {
+    const today = new Date().toISOString();
+
+    // Извлекаем аяты из таблицы ayahs и текст аятов из таблицы ayah_texts
+    db.all(`
+      SELECT 
+        ayahs.id AS ayah_id,
+        ayahs.user_id,
+        ayahs.page,
+        ayahs.next_review,
+        ayahs.review_stage,
+        ayahs.review_step,
+        ayah_texts.surah,
+        ayah_texts.ayah,
+        ayah_texts.text -- Текст аята из таблицы ayah_texts
+      FROM ayahs
+      INNER JOIN ayah_texts 
+        ON ayahs.page = ayah_texts.page 
+        AND ayahs.ayah = ayah_texts.ayah -- Добавляем условие по номеру аята
+      WHERE ayahs.user_id = ? AND ayahs.next_review <= ?
+    `, [userId, today], (err, rows) => {
+      if (err) {
+        reject(err);
+      } else {
+        // Преобразуем данные в нужный формат
+        const ayahs = rows.map(row => ({
+          id: row.ayah_id, // Уникальный ID аята из таблицы ayahs
+          user_id: row.user_id,
+          page: row.page,
+          surah: row.surah,
+          ayah: row.ayah,
+          text: row.text, // Текст аята из таблицы ayah_texts
+          nextReview: new Date(row.next_review),
+          reviewStage: row.review_stage,
+          reviewStep: row.review_step
+        }));
+        resolve(ayahs);
+      }
+    });
+  });
+}
+
+async function updateReviewSchedule(userId) {
+  return new Promise((resolve, reject) => {
+    const today = new Date().toISOString();
+
+    // Получаем все аяты, которые нужно обновить
+    db.all(`
+      SELECT * FROM ayahs
+      WHERE user_id = ? AND next_review <= ?
+    `, [userId, today], (err, ayahs) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      // Обновляем каждый аят
+      const stmt = db.prepare(`
+        UPDATE ayahs
+        SET next_review = ?, review_stage = ?, review_step = ?
+        WHERE id = ?
+      `);
+
+      ayahs.forEach(ayah => {
+        let reviewSteps = intervals[ayah.review_stage];
+        let newReviewStage = ayah.review_stage;
+        let newReviewStep = ayah.review_step;
+
+        if (newReviewStep >= reviewSteps.length - 1) {
+          if (newReviewStage === "sabak") newReviewStage = "sabki";
+          else if (newReviewStage === "sabki") newReviewStage = "manzil";
+          newReviewStep = 0;
+        } else {
+          newReviewStep++;
+        }
+
+        const nextReviewDate = new Date();
+        nextReviewDate.setDate(nextReviewDate.getDate() + intervals[newReviewStage][newReviewStep]);
+
+        stmt.run(
+          nextReviewDate.toISOString(),
+          newReviewStage,
+          newReviewStep,
+          ayah.id
+        );
+      });
+
+      stmt.finalize();
+      resolve();
+    });
+  });
+}
+
+async function sendReviewAyahs(userId, chatId, reciter = "husary", notification = false) {
+  const ayahs = await getAyahsForReview(userId);
   if (ayahs.length === 0) {
     logger.info("Сегодня нет аятов для повторения.");
     await bot.telegram.sendMessage(chatId, "Сегодня нет аятов для повторения.");
     return;
   }
 
+  if (notification) {
+    logger.info("Сегодня есть аятов для повторения. /review");
+    await bot.telegram.sendMessage(chatId, "Сегодня есть аятов для повторения. /review");
+    return;
+  }
+
   for (const ayah of ayahs) {
     try {
-      const audioUrl = getAudioUrl(ayah, reciter);
-      const response = await axios.get(audioUrl);
-      const audioLink = response.data.data.audio;
+      // Получаем file_id аудио из базы данных
+      let fileId = await getAudioFileId(ayah.surah, ayah.ayah, reciter);
 
-      const filePath = `ayah_${ayah.surah}_${ayah.ayah}.mp3`;
-      const writer = fs.createWriteStream(filePath);
-      const audioResponse = await axios.get(audioLink, { responseType: "stream" });
-      audioResponse.data.pipe(writer);
-
-      await new Promise((resolve, reject) => {
-        writer.on("finish", resolve);
-        writer.on("error", reject);
-      });
-
-      const tags = {
-        title: `Сура ${ayah.surah}, Аят ${ayah.ayah}`,
-        artist: `Шейх ${reciter.charAt(0).toUpperCase() + reciter.slice(1)}`,
-        album: "Holy Quran",
-        comment: { text: "Из AlQuran Cloud API" },
-      };
-      NodeID3.write(tags, filePath);
-
-      const messageText = `📖 *${ayah.surah}:${ayah.ayah}* (стр. ${ayah.page})\n${ayah.text}`;
-
-      try {
-        await bot.telegram.sendAudio(chatId, { source: filePath }, {
-          caption: messageText,
-          parse_mode: "Markdown",
-        });
-      } catch (error) {
-        if (error.response && error.response.error_code === 400 && error.response.description.includes("message caption is too long")) {
-          const audioMessage = await bot.telegram.sendAudio(chatId, { source: filePath });
-          await bot.telegram.sendMessage(chatId, messageText, { reply_to_message_id: audioMessage.message_id, parse_mode: "Markdown" });
-        } else {
-          throw error;
-        }
+      // Если file_id нет, загружаем аудио и сохраняем его file_id
+      if (!fileId) {
+        fileId = await uploadAndSaveAudio(ayah, chatId, reciter);
       }
 
-      fs.unlinkSync(filePath);
+      // Формируем текст сообщения
+      const messageText = `📖 *${ayah.surah}:${ayah.ayah}* (стр. ${ayah.page})\n${ayah.text}`;
+
+      // Отправляем аудио и текст
+      await sendAudioWithCaption(chatId, fileId, messageText);
+
     } catch (error) {
       logger.error(`Ошибка при отправке аята ${ayah.surah}:${ayah.ayah}:`, error);
       await bot.telegram.sendMessage(chatId, `📖 ${ayah.surah}:${ayah.ayah} (стр. ${ayah.page})\n${ayah.text}`);
@@ -220,28 +269,247 @@ async function sendReviewAyahs(chatId, reciter = "husary") {
   }
 }
 
+/**
+ * Загружает аудио, отправляет его пользователю и сохраняет file_id в базу данных.
+ */
+async function uploadAndSaveAudio(ayah, chatId, reciter) {
+  const audioUrl = getAudioUrl(ayah, reciter);
+  const response = await axios.get(audioUrl);
+  const audioLink = response.data.data.audio;
+
+  const filePath = `ayah_${ayah.surah}_${ayah.ayah}.mp3`;
+  const writer = fs.createWriteStream(filePath);
+  const audioResponse = await axios.get(audioLink, { responseType: "stream" });
+  audioResponse.data.pipe(writer);
+
+  await new Promise((resolve, reject) => {
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
+
+  // Добавляем метаданные к аудио
+  const tags = {
+    title: `Сура ${ayah.surah}, Аят ${ayah.ayah}`,
+    artist: `Шейх ${reciter.charAt(0).toUpperCase() + reciter.slice(1)}`,
+    album: "Holy Quran",
+    comment: { text: "Из AlQuran Cloud API" },
+  };
+  NodeID3.write(tags, filePath);
+
+  // Отправляем аудио пользователю
+  const audioMessage = await bot.telegram.sendAudio(chatId, { source: filePath });
+  const fileId = audioMessage.audio.file_id;
+
+  // Формируем ayah_id в нужном формате
+  const ayahId = formatAyahId(ayah.surah, ayah.ayah);
+  // Сохраняем file_id в базу данных
+  db.run(`
+    INSERT INTO audio_files (ayah_id, reciter, file_id)
+    VALUES (?, ?, ?)
+  `, [ayahId, reciter, fileId]);
+
+  // Удаляем временный файл
+  fs.unlinkSync(filePath);
+
+  return fileId;
+}
+
+/**
+ * Отправляет аудио с подписью или текстом отдельным сообщением, если подпись слишком длинная.
+ */
+async function sendAudioWithCaption(chatId, fileId, messageText) {
+  const maxCaptionLength = 1024;
+
+  if (messageText.length <= maxCaptionLength) {
+    // Если текст короткий, отправляем аудио с подписью
+    await bot.telegram.sendAudio(chatId, fileId, {
+      caption: messageText,
+      parse_mode: "Markdown",
+    });
+  } else {
+    // Если текст длинный, отправляем аудио без подписи, а текст отдельным сообщением
+    const audioMessage = await bot.telegram.sendAudio(chatId, fileId);
+    await bot.telegram.sendMessage(chatId, messageText, {
+      reply_to_message_id: audioMessage.message_id,
+      parse_mode: "Markdown",
+    });
+  }
+}
+
+async function createUser(chatId) {
+  return new Promise((resolve, reject) => {
+    db.run("INSERT INTO users (chat_id) VALUES (?)", [chatId], function (err) {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(this.lastID); // Возвращаем ID нового пользователя
+      }
+    });
+  });
+}
+
+async function getAudioFileId(surah, ayah, reciter) {
+  const ayahId = formatAyahId(surah, ayah);
+  return new Promise((resolve, reject) => {
+    db.get(`
+      SELECT file_id FROM audio_files
+      WHERE ayah_id = ? AND reciter = ?
+    `, [ayahId, reciter], (err, row) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(row ? row.file_id : null);
+      }
+    });
+  });
+}
+
+async function getAyahsByUser(userId) {
+  return new Promise((resolve, reject) => {
+    db.all("SELECT * FROM ayahs WHERE user_id = ?", [userId], (err, rows) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(rows);
+      }
+    });
+  });
+}
+
+async function removePageForUser(userId, pageNumber) {
+  return new Promise((resolve, reject) => {
+    db.run("DELETE FROM ayahs WHERE user_id = ? AND page = ?", [userId, pageNumber], function (err) {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(this.changes); // Возвращаем количество удаленных строк
+      }
+    });
+  });
+}
+
+async function getProgressForUser(userId) {
+  return new Promise((resolve, reject) => {
+    db.all(`
+      SELECT page, review_stage, COUNT(*) as count
+      FROM ayahs
+      WHERE user_id = ?
+      GROUP BY page, review_stage
+    `, [userId], (err, rows) => {
+      if (err) {
+        reject(err);
+      } else {
+        const progress = {};
+        rows.forEach(row => {
+          if (!progress[row.page]) {
+            progress[row.page] = { total: 0, sabak: 0, sabki: 0, manzil: 0 };
+          }
+          progress[row.page].total += row.count;
+          progress[row.page][row.review_stage] += row.count;
+        });
+        resolve(progress);
+      }
+    });
+  });
+}
+
+async function getAllUsers() {
+  return new Promise((resolve, reject) => {
+    db.all("SELECT * FROM users", (err, rows) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(rows);
+      }
+    });
+  });
+}
+
+async function getAyahsFromDatabase(pageNumber, startAyah, endAyah) {
+  return new Promise((resolve, reject) => {
+    let query = `
+      SELECT * FROM ayah_texts
+      WHERE page = ?
+    `;
+    const params = [pageNumber];
+
+    if (startAyah && endAyah) {
+      query += ` AND ayah BETWEEN ? AND ?`;
+      params.push(startAyah, endAyah);
+    }
+
+    db.all(query, params, (err, rows) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(rows.map(row => ({
+          number: row.id, // Используем id как уникальный номер
+          text: row.text,
+          surah: row.surah,
+          ayah: row.ayah,
+          page: row.page,
+          nextReview: new Date(),
+          reviewStage: "sabak",
+          reviewStep: 0
+        })));
+      }
+    });
+  });
+}
+
+async function saveAyahsToDatabase(ayahs) {
+  const stmt = db.prepare(`
+    INSERT INTO ayah_texts (surah, ayah, text, page)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  ayahs.forEach(ayah => {
+    stmt.run(
+      ayah.surah.number,
+      ayah.numberInSurah,
+      ayah.text,
+      ayah.page
+    );
+  });
+
+  stmt.finalize();
+}
+
 // Команда /review
 bot.command("review", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  const chatId = ctx.message.chat.id;
+  const user = await getUserByChatId(chatId);
+  if (!user) {
+    return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
   }
 
   const args = ctx.message.text.split(" ");
   const reciter = args[1] || "husary"; // По умолчанию Хусари
 
-  await sendReviewAyahs(ctx.message.chat.id, reciter);
+  await sendReviewAyahs(user.id, chatId, reciter);
 });
 
 // Расписание для автоматической отправки в 6 утра
 schedule.scheduleJob("0 3 * * *", async () => {
   logger.info("Обновление статуса повторения и отправка аятов...");
-  updateReviewSchedule();
-  await sendReviewAyahs(USER_CHAT_ID); // Используем USER_CHAT_ID из переменных окружения
+
+  // Получаем всех пользователей
+  const users = await getAllUsers();
+  for (const user of users) {
+    try {
+      await updateReviewSchedule(user.id);
+      await sendReviewAyahs(user.id, user.chat_id, 'husary', true);
+    } catch (error) {
+      logger.error(`Ошибка при обработке пользователя ${user.chat_id}:`, error);
+    }
+  }
 });
 
 bot.command("addpage", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  const chatId = ctx.message.chat.id;
+  const user = await getUserByChatId(chatId);
+  if (!user) {
+    return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
   }
 
   const args = ctx.message.text.split(" ");
@@ -255,7 +523,7 @@ bot.command("addpage", async (ctx) => {
   }
 
   try {
-    await addPageForMemorization(pageNumber);
+    await addPageForMemorization(user.id, pageNumber);
     ctx.reply(`✅ Страница ${pageNumber} добавлена в план заучивания!`);
   } catch (error) {
     ctx.reply("❌ Произошла ошибка при добавлении страницы.");
@@ -263,45 +531,14 @@ bot.command("addpage", async (ctx) => {
   }
 });
 
-bot.command("addayah", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
-  }
-
-  const args = ctx.message.text.split(" ");
-  if (args.length < 4) {
-    return ctx.reply("❌ Используйте команду так: /addayah <номер_страницы> <начальный_аят> <конечный_аят>");
-  }
-
-  const pageNumber = parseInt(args[1]);
-  const startAyah = parseInt(args[2]);
-  const endAyah = parseInt(args[3]);
-
-  if (!isValidPageNumber(pageNumber) || isNaN(startAyah) || isNaN(endAyah)) {
-    return ctx.reply("❌ Укажите корректные номера страницы и аятов.");
-  }
-
-  if (startAyah > endAyah) {
-    return ctx.reply("❌ Начальный аят не может быть больше конечного.");
-  }
-
-  const newAyahs = await fetchAyahsByPage(pageNumber, startAyah, endAyah);
-  if (newAyahs.length === 0) {
-    return ctx.reply("❌ Аяты не найдены.");
-  }
-
-  let data = loadData();
-  data = [...data, ...newAyahs];
-  saveData(data);
-  ctx.reply(`✅ Аяты ${startAyah}-${endAyah} со страницы ${pageNumber} добавлены.`);
-});
-
 bot.command("list", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  const chatId = ctx.message.chat.id;
+  const user = await getUserByChatId(chatId);
+  if (!user) {
+    return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
   }
 
-  const data = loadData();
+  const data = await getAyahsByUser(user.id);
   if (data.length === 0) {
     return ctx.reply("❌ Нет данных для отображения.");
   }
@@ -311,8 +548,10 @@ bot.command("list", async (ctx) => {
 });
 
 bot.command("remove", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  const chatId = ctx.message.chat.id;
+  const user = await getUserByChatId(chatId);
+  if (!user) {
+    return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
   }
 
   const args = ctx.message.text.split(" ");
@@ -325,36 +564,26 @@ bot.command("remove", async (ctx) => {
     return ctx.reply("❌ Укажите номер страницы от 1 до 604.");
   }
 
-  let data = loadData();
-  const initialLength = data.length;
-  data = data.filter(ayah => ayah.page !== pageNumber);
-
-  if (data.length === initialLength) {
-    return ctx.reply(`❌ Страница ${pageNumber} не найдена в списке заучивания.`);
+  try {
+    await removePageForUser(user.id, pageNumber);
+    ctx.reply(`✅ Страница ${pageNumber} удалена из списка заучивания.`);
+  } catch (error) {
+    ctx.reply("❌ Произошла ошибка при удалении страницы.");
+    logger.error("Ошибка при удалении страницы:", error);
   }
-
-  saveData(data);
-  ctx.reply(`✅ Страница ${pageNumber} удалена из списка заучивания.`);
 });
 
 bot.command("progress", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  const chatId = ctx.message.chat.id;
+  const user = await getUserByChatId(chatId);
+  if (!user) {
+    return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
   }
 
-  const data = loadData();
-  if (data.length === 0) {
+  const progress = await getProgressForUser(user.id);
+  if (Object.keys(progress).length === 0) {
     return ctx.reply("❌ Нет данных для отображения.");
   }
-
-  const progress = {};
-  data.forEach(ayah => {
-    if (!progress[ayah.page]) {
-      progress[ayah.page] = { total: 0, sabak: 0, sabki: 0, manzil: 0 };
-    }
-    progress[ayah.page].total++;
-    progress[ayah.page][ayah.reviewStage]++;
-  });
 
   let message = "📊 <b>Прогресс заучивания:</b>\n";
   Object.keys(progress).sort((a, b) => a - b).forEach(page => {
@@ -369,12 +598,14 @@ bot.command("progress", async (ctx) => {
 });
 
 bot.command("update", async (ctx) => {
-  if (!isAuthorizedUser(ctx.message.chat.id)) {
-    return ctx.reply("❌ У вас нет доступа к этой команде.");
+  const chatId = ctx.message.chat.id;
+  const user = await getUserByChatId(chatId);
+  if (!user) {
+    return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
   }
 
   try {
-    updateReviewSchedule();
+    await updateReviewSchedule(user.id);
     ctx.reply("✅ Расписание повторений обновлено.");
   } catch (error) {
     ctx.reply("❌ Произошла ошибка при обновлении расписания.");
@@ -393,7 +624,17 @@ bot.command("reciters", async (ctx) => {
   ctx.replyWithHTML(message);
 });
 
-bot.command("start", (ctx) => {
+bot.command("start", async (ctx) => {
+  const chatId = ctx.message.chat.id;
+
+  // Проверяем, существует ли пользователь в базе данных
+  const user = await getUserByChatId(chatId);
+  if (!user) {
+    // Если пользователя нет, создаем нового
+    await createUser(chatId);
+    logger.info(`Новый пользователь создан: ${chatId}`);
+  }
+
   const welcomeMessage = `
 👋 <b>Добро пожаловать в бота для заучивания Корана!</b>
 
@@ -401,7 +642,6 @@ bot.command("start", (ctx) => {
 
 📚 <b>Основные команды:</b>
 - <code>/addpage &lt;номер_страницы&gt;</code> — Добавить страницу для заучивания.
-- <code>/addayah &lt;номер_страницы&gt; &lt;начальный_аят&gt; &lt;конечный_аят&gt;</code> — Добавить аяты для заучивания.
 - <code>/review [чтец]</code> — Получить аяты для повторения на сегодня.
 - <code>/list</code> — Показать все страницы, которые находятся в процессе заучивания.
 - <code>/remove &lt;номер_страницы&gt;</code> — Удалить страницу из списка заучивания.
@@ -420,15 +660,15 @@ bot.command("start", (ctx) => {
 Для получения дополнительной информации используйте команду <code>/help</code>.
 `;
 
-  ctx.replyWithHTML(welcomeMessage);
+  await ctx.replyWithHTML(welcomeMessage);
 });
+
 bot.command("help", async (ctx) => {
   const helpMessage = `
 📚 <b>Инструкция по использованию бота:</b>
 
 <b>1. Основные команды:</b>
 - <code>/addpage &lt;номер_страницы&gt;</code> — Добавить страницу для заучивания (например, <code>/addpage 1</code>).
-- <code>/addayah &lt;номер_страницы&gt; &lt;начальный_аят&gt; &lt;конечный_аят&gt;</code> — Добавить аяты для заучивания (например, <code>/addayah 1 1 10</code>).
 - <code>/review [чтец]</code> — Получить аяты для повторения на сегодня. Доступные чтецы: <i>husary</i>, <i>alafasy</i>, <i>abdulsamad</i>.
 - <code>/list</code> — Показать все страницы, которые находятся в процессе заучивания.
 - <code>/remove &lt;номер_страницы&gt;</code> — Удалить страницу из списка заучивания (например, <code>/remove 1</code>).

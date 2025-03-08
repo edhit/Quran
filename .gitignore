@@ -132,3 +132,4 @@ dist
 
 quran_data.json
 quran_data_backup_*.json
+*.db

@@ -252,15 +252,18 @@ async function sendReviewAyahs(userId, chatId, reciter = "husary", notification 
       let fileId = await getAudioFileId(ayah.surah, ayah.ayah, reciter);
 
       // Если file_id нет, загружаем аудио и сохраняем его file_id
+      let messageId = false;
       if (!fileId) {
-        fileId = await uploadAndSaveAudio(ayah, chatId, reciter);
+        let audio = await uploadAndSaveAudio(ayah, chatId, reciter);
+        fileId = audio.fileId
+        messageId = audio.messageId
       }
 
       // Формируем текст сообщения
       const messageText = `📖 *${ayah.surah}:${ayah.ayah}* (стр. ${ayah.page})\n${ayah.text}`;
 
       // Отправляем аудио и текст
-      await sendAudioWithCaption(chatId, fileId, messageText);
+      await sendAudioWithCaption(chatId, fileId, messageText, messageId);
 
     } catch (error) {
       logger.error(`Ошибка при отправке аята ${ayah.surah}:${ayah.ayah}:`, error);
@@ -311,13 +314,25 @@ async function uploadAndSaveAudio(ayah, chatId, reciter) {
   // Удаляем временный файл
   fs.unlinkSync(filePath);
 
-  return fileId;
+  return {
+    fileId: fileId, 
+    messageId: audioMessage.message_id
+  };
 }
 
 /**
  * Отправляет аудио с подписью или текстом отдельным сообщением, если подпись слишком длинная.
  */
-async function sendAudioWithCaption(chatId, fileId, messageText) {
+async function sendAudioWithCaption(chatId, fileId, messageText, messageId) {
+  if (messageId) {
+    await bot.telegram.sendMessage(chatId, messageText, {
+      reply_to_message_id: messageId,
+      parse_mode: "Markdown",
+    });
+
+    return;
+  }
+
   const maxCaptionLength = 1024;
 
   if (messageText.length <= maxCaptionLength) {

@@ -45,6 +45,7 @@ const helpMessage = `
 Если у вас есть вопросы, напишите <code>/start</code> для получения основной информации.
 `;
 
+const pendingAddPage = {}; // { chatId: true/false }
 
 const intervals = {
   sabak: [1, 3, 7],
@@ -589,26 +590,16 @@ bot.command("addpage", async (ctx) => {
   try {
     const chatId = ctx.message.chat.id;
     const user = await getUserByChatId(chatId);
+
     if (!user) {
       logger.error(`Пользователь не найден: ${chatId}`);
       return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
     }
 
-    const args = ctx.message.text.split(" ");
-    if (args.length < 2) {
-      logger.warn(`Пользователь ${chatId} не указал номер страницы`);
-      return ctx.reply("❌ Используйте команду так: /addpage <номер_страницы>");
-    }
+    // Устанавливаем флаг ожидания
+    pendingAddPage[chatId] = true;
 
-    const pageNumber = parseInt(args[1]);
-    if (!isValidPageNumber(pageNumber)) {
-      logger.warn(`Пользователь ${chatId} указал неверный номер страницы: ${pageNumber}`);
-      return ctx.reply("❌ Укажите номер страницы от 1 до 604.");
-    }
-
-    await addPageForMemorization(user.id, pageNumber);
-    logger.info(`Страница ${pageNumber} добавлена для пользователя ${chatId}`);
-    await ctx.reply(`✅ Страница ${pageNumber} добавлена в план заучивания!`);
+    await ctx.reply("Введите номер страницы, которую хотите добавить (от 1 до 604):");
   } catch (error) {
     logger.error(`Ошибка в команде /addpage: ${error.message}`);
     ctx.reply("❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.");
@@ -853,7 +844,16 @@ bot.hears("📚 Список страниц", async (ctx) => {
 bot.hears("➕ Добавить страницу", async (ctx) => {
   try {
     const chatId = ctx.message.chat.id;
-    logger.info(`Пользователь ${chatId} начал процесс добавления страницы`);
+    const user = await getUserByChatId(chatId);
+
+    if (!user) {
+      logger.error(`Пользователь не найден: ${chatId}`);
+      return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
+    }
+
+    // Устанавливаем флаг ожидания
+    pendingAddPage[chatId] = true;
+
     await ctx.reply("Введите номер страницы, которую хотите добавить (от 1 до 604):");
   } catch (error) {
     logger.error(`Ошибка в обработчике "➕ Добавить страницу": ${error.message}`);
@@ -868,6 +868,46 @@ bot.hears("🆘 Помощь", async (ctx) => {
     await ctx.replyWithHTML(helpMessage);
   } catch (error) {
     logger.error(`Ошибка в обработчике "🆘 Помощь": ${error.message}`);
+    ctx.reply("❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.");
+  }
+});
+
+bot.command("cancel", (ctx) => {
+  const chatId = ctx.message.chat.id;
+
+  if (pendingAddPage[chatId]) {
+    delete pendingAddPage[chatId];
+    ctx.reply("❌ Добавление страницы отменено.");
+  } else {
+    ctx.reply("❌ Нет активных команд для отмены.");
+  }
+});
+
+bot.on("text", async (ctx) => {
+  try {
+    const chatId = ctx.message.chat.id;
+
+    // Проверяем, ожидает ли пользователь ввода номера страницы
+    if (pendingAddPage[chatId]) {
+      const pageNumber = parseInt(ctx.message.text);
+
+      // Проверяем, что введённый номер корректен
+      if (!isValidPageNumber(pageNumber)) {
+        logger.warn(`Пользователь ${chatId} ввел неверный номер страницы: ${pageNumber}`);
+        return ctx.reply("❌ Укажите номер страницы от 1 до 604.");
+      }
+
+      // Добавляем страницу
+      const user = await getUserByChatId(chatId);
+      await addPageForMemorization(user.id, pageNumber);
+      logger.info(`Страница ${pageNumber} добавлена для пользователя ${chatId}`);
+      await ctx.reply(`✅ Страница ${pageNumber} добавлена в план заучивания!`);
+
+      // Сбрасываем флаг ожидания
+      delete pendingAddPage[chatId];
+    }
+  } catch (error) {
+    logger.error(`Ошибка при добавлении страницы: ${error.message}`);
     ctx.reply("❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.");
   }
 });

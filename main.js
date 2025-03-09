@@ -232,7 +232,7 @@ async function updateReviewSchedule(userId) {
   });
 }
 
-async function sendReviewAyahs(userId, chatId, reciter = "husary", notification = false) {
+async function sendReviewAyahs(userId, chatId, reciter = null, notification = false) {
   const ayahs = await getAyahsForReview(userId);
   if (ayahs.length === 0) {
     logger.info("Сегодня нет аятов для повторения.");
@@ -241,13 +241,20 @@ async function sendReviewAyahs(userId, chatId, reciter = "husary", notification 
   }
 
   if (notification) {
-    logger.info("Сегодня есть аятов для повторения. /review");
-    await bot.telegram.sendMessage(chatId, "Сегодня есть аятов для повторения. /review");
+    logger.info("Проверьте наличие аятов для повторения. /review");
+    await bot.telegram.sendMessage(chatId, "Проверьте наличие аятов для повторения. /review");
     return;
   }
 
   for (const ayah of ayahs) {
     try {
+      const messageText = `📖 *${ayah.surah}:${ayah.ayah}* (стр. ${ayah.page})\n${ayah.text}`;
+      // Если чтец не указан, отправляем только текст
+      if (!reciter) {
+        await bot.telegram.sendMessage(chatId, messageText, { parse_mode: "Markdown" });
+        continue;
+      }
+      
       // Получаем file_id аудио из базы данных
       let fileId = await getAudioFileId(ayah.surah, ayah.ayah, reciter);
 
@@ -258,9 +265,6 @@ async function sendReviewAyahs(userId, chatId, reciter = "husary", notification 
         fileId = audio.fileId
         messageId = audio.messageId
       }
-
-      // Формируем текст сообщения
-      const messageText = `📖 *${ayah.surah}:${ayah.ayah}* (стр. ${ayah.page})\n${ayah.text}`;
 
       // Отправляем аудио и текст
       await sendAudioWithCaption(chatId, fileId, messageText, messageId);
@@ -499,7 +503,7 @@ bot.command("review", async (ctx) => {
   }
 
   const args = ctx.message.text.split(" ");
-  const reciter = args[1] || "husary"; // По умолчанию Хусари
+  const reciter = args[1] || null;
 
   await sendReviewAyahs(user.id, chatId, reciter);
 });
@@ -513,7 +517,7 @@ schedule.scheduleJob("0 3 * * *", async () => {
   for (const user of users) {
     try {
       await updateReviewSchedule(user.id);
-      await sendReviewAyahs(user.id, user.chat_id, 'husary', true);
+      await sendReviewAyahs(user.id, user.chat_id, null, true);
     } catch (error) {
       logger.error(`Ошибка при обработке пользователя ${user.chat_id}:`, error);
     }

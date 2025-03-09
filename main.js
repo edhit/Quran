@@ -539,6 +539,16 @@ async function saveAyahsToDatabase(ayahs) {
   stmt.finalize();
 }
 
+bot.use((ctx, next) => {
+  if (ctx.chat.type === 'private') {
+    return next();
+  } else if (ctx.message && ctx.message.text && ctx.message.text.includes(`@${ctx.botInfo.username}`)) {
+    return next(); // Обрабатываем команды с упоминанием бота
+  } else {
+    return; // Игнорируем всё остальное
+  }
+});
+
 bot.command("hidekeyboard", async (ctx) => {
   try {
     const chatId = ctx.message.chat.id;

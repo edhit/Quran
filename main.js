@@ -4,6 +4,7 @@ const schedule = require("node-schedule");
 const NodeID3 = require("node-id3");
 require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
+const XLSX = require('xlsx');
 const { createLogger, format, transports } = require("winston");
 const db = require('./database')
 
@@ -21,6 +22,7 @@ const helpMessage = `
 - <code>/remove &lt;номер_страницы&gt;</code> — Удалить страницу из списка заучивания (например, <code>/remove 1</code>).
 - <code>/update</code> — Обновить расписание повторений вручную.
 - <code>/progress</code> — Показать прогресс заучивания.
+- <code>/export</code> — Получить таблицу Excel страниц заучивания.
 - <code>/help</code> — Показать это сообщение.
 
 <b>2. Программа заучивания:</b>
@@ -34,13 +36,9 @@ const helpMessage = `
 - Вы можете запросить аяты для повторения в любое время с помощью команды <code>/review</code>.
 
 <b>4. Примеры использования:</b>
-- Добавить страницу: <code>/addpage</code>
+- Добавить страницу 1: <code>/addpage</code> -> Укажите страницу
 - Удалить страницу 1: <code>/remove 1</code>
 - Получить аяты: <code>/review</code>
-
-<b>5. Дополнительные функции:</b>
-- <code>/progress</code> — Показывает прогресс заучивания по каждой странице.
-- <code>/reciters</code> — Список доступных чтецов и их стилей.
 
 Если у вас есть вопросы, напишите <code>/start</code> для получения основной информации.
 `;
@@ -64,6 +62,37 @@ const logger = createLogger({
     new transports.File({ filename: "bot.log" })
   ]
 });
+
+async function exportProgressToExcel(userId) {
+    // Получаем данные о прогрессе пользователя
+    const progress = await getProgressForUser(userId);
+
+    // Создаем массив для данных таблицы
+    const data = [];
+    data.push(["Страница", "Всего аятов", "Сабақ", "Сабқи", "Манзиль"]); // Заголовки
+
+    // Заполняем данные
+    Object.keys(progress).sort((a, b) => a - b).forEach(page => {
+        data.push([
+            page,
+            progress[page].total,
+            progress[page].sabak,
+            progress[page].sabki,
+            progress[page].manzil
+        ]);
+    });
+
+    // Создаем книгу и лист
+    const workbook = XLSX.utils.book_new();
+    const worksheet = XLSX.utils.aoa_to_sheet(data);
+    XLSX.utils.book_append_sheet(workbook, worksheet, "Прогресс");
+
+    // Сохраняем файл
+    const fileName = `progress_${userId}.xlsx`;
+    XLSX.writeFile(workbook, fileName);
+
+    return fileName;
+}
 
 function isValidPageNumber(pageNumber) {
   return !isNaN(pageNumber) && pageNumber >= 1 && pageNumber <= 604;
@@ -453,28 +482,28 @@ async function removePageForUser(userId, pageNumber) {
 }
 
 async function getProgressForUser(userId) {
-  return new Promise((resolve, reject) => {
-    db.all(`
-      SELECT page, review_stage, COUNT(*) as count
-      FROM ayahs
-      WHERE user_id = ?
-      GROUP BY page, review_stage
-    `, [userId], (err, rows) => {
-      if (err) {
-        reject(err);
-      } else {
-        const progress = {};
-        rows.forEach(row => {
-          if (!progress[row.page]) {
-            progress[row.page] = { total: 0, sabak: 0, sabki: 0, manzil: 0 };
-          }
-          progress[row.page].total += row.count;
-          progress[row.page][row.review_stage] += row.count;
+    return new Promise((resolve, reject) => {
+        db.all(`
+            SELECT page, review_stage, COUNT(*) as count
+            FROM ayahs
+            WHERE user_id = ?
+            GROUP BY page, review_stage
+        `, [userId], (err, rows) => {
+            if (err) {
+                reject(err);
+            } else {
+                const progress = {};
+                rows.forEach(row => {
+                    if (!progress[row.page]) {
+                        progress[row.page] = { total: 0, sabak: 0, sabki: 0, manzil: 0 };
+                    }
+                    progress[row.page].total += row.count;
+                    progress[row.page][row.review_stage] += row.count;
+                });
+                resolve(progress);
+            }
         });
-        resolve(progress);
-      }
     });
-  });
 }
 
 async function getAllUsers() {
@@ -693,6 +722,29 @@ bot.command("progress", async (ctx) => {
   }
 });
 
+bot.command("export", async (ctx) => {
+    try {
+        const chatId = ctx.message.chat.id;
+        const user = await getUserByChatId(chatId);
+
+        if (!user) {
+            return ctx.reply("❌ Пользователь не найден. Используйте /start для регистрации.");
+        }
+
+        // Экспортируем данные в Excel
+        const fileName = await exportProgressToExcel(user.id);
+
+        // Отправляем файл пользователю
+        await ctx.replyWithDocument({ source: fileName });
+
+        // Удаляем временный файл
+        fs.unlinkSync(fileName);
+    } catch (error) {
+        logger.error(`Ошибка в команде /export: ${error.message}`);
+        ctx.reply("❌ Произошла ошибка. Пожалуйста, попробуйте ещё раз.");
+    }
+});
+
 bot.command("update", async (ctx) => {
   try {
     const chatId = ctx.message.chat.id;
@@ -751,13 +803,13 @@ bot.command("start", async (ctx) => {
 - <code>/remove &lt;номер_страницы&gt;</code> — Удалить страницу из списка заучивания.
 - <code>/update</code> — Обновить расписание повторений вручную.
 - <code>/progress</code> — Показать прогресс заучивания.
-- <code>/reciters</code> — Список доступных чтецов.
+- <code>/export</code> — Получить таблицу Excel страниц заучивания.
 - <code>/help</code> — Подробная инструкция и информация о программе.
 
 📅 <b>Аяты для повторения приходят каждый день в 6:00 утра.</b>
 
 <b>Примеры использования:</b>
-- Добавить страницу: <code>/addpage</code>
+- Добавить страницу 1: <code>/addpage</code> -> Укажите страницу
 - Удалить страницу 1: <code>/remove 1</code>
 - Получить аяты для повторения: <code>/review</code>
 
